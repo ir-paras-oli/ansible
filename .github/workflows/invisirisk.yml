@@ -2,7 +2,7 @@ name: ansible x InvisiRisk
 
 on:
   schedule:
-    - cron: '25 4 * * *'
+    - cron: '0 0 * * 1'  # every Monday morning
   workflow_dispatch:
 
 permissions:
