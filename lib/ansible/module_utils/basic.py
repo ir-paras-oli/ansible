@@ -1657,10 +1657,11 @@ class AnsibleModule(object):
             ext = time.strftime("%Y-%m-%d@%H:%M:%S~", time.localtime(time.time()))
             backupdest = '%s.%s.%s' % (fn, os.getpid(), ext)
 
-            try:
-                self.preserved_copy(fn, backupdest)
-            except (shutil.Error, OSError) as ex:
-                raise Exception(f'Could not make backup of {fn!r} to {backupdest!r}.') from ex
+            if not self.check_mode:
+                try:
+                    self.preserved_copy(fn, backupdest)
+                except (shutil.Error, IOError) as ex:
+                    raise Exception(f'Could not make backup of {fn!r} to {backupdest!r}.') from ex
 
         return backupdest
 
@@ -2198,7 +2199,7 @@ def __getattr__(importable_name):
         importable = repeat
     elif importable_name in {
         'PY2', 'PY3', 'b', 'binary_type', 'integer_types',
-        'iteritems', 'string_types', 'test_type'
+        'iteritems', 'string_types', 'text_type',
     }:
         import importlib
         importable = getattr(
