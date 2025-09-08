@@ -19,7 +19,7 @@ from ansible.errors import (
     AnsibleError, AnsibleParserError, AnsibleUndefinedVariable, AnsibleTaskError,
     AnsibleValueOmittedError,
 )
-from ansible.executor.task_result import _RawTaskResult
+from ansible.executor.task_result import _RawTaskResult, _SUB_PRESERVE
 from ansible._internal._datatag import _utils
 from ansible.module_utils._internal import _messages
 from ansible.module_utils.datatag import native_type_name, deprecator_from_collection_name
@@ -27,7 +27,6 @@ from ansible._internal._datatag._tags import TrustedAsTemplate
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.module_utils.common.text.converters import to_text, to_native
 from ansible.module_utils.connection import write_to_stream
-from ansible.module_utils.six import string_types
 from ansible.playbook.task import Task
 from ansible.plugins import get_plugin_class
 from ansible.plugins.loader import become_loader, cliconf_loader, connection_loader, httpapi_loader, netconf_loader, terminal_loader
@@ -48,6 +47,7 @@ display = Display()
 
 
 RETURN_VARS = [x for x in C.MAGIC_VARIABLE_MAPPING.items() if 'become' not in x and '_pass' not in x]
+_INJECT_FACTS, _INJECT_FACTS_ORIGIN = C.config.get_config_value_and_origin('INJECT_FACTS_AS_VARS')
 
 __all__ = ['TaskExecutor']
 
@@ -340,7 +340,7 @@ class TaskExecutor:
                 })
 
             # if plugin is loaded, get resolved name, otherwise leave original task connection
-            if self._connection and not isinstance(self._connection, string_types):
+            if self._connection and not isinstance(self._connection, str):
                 task_fields['connection'] = getattr(self._connection, 'ansible_name')
 
             tr = _RawTaskResult(
@@ -664,8 +664,11 @@ class TaskExecutor:
                     # TODO: cleaning of facts should eventually become part of taskresults instead of vars
                     af = result['ansible_facts']
                     vars_copy['ansible_facts'] = combine_vars(vars_copy.get('ansible_facts', {}), namespace_facts(af))
-                    if C.INJECT_FACTS_AS_VARS:
-                        cleaned_toplevel = {k: _deprecate_top_level_fact(v) for k, v in clean_facts(af).items()}
+                    if _INJECT_FACTS:
+                        if _INJECT_FACTS_ORIGIN == 'default':
+                            cleaned_toplevel = {k: _deprecate_top_level_fact(v) for k, v in clean_facts(af).items()}
+                        else:
+                            cleaned_toplevel = clean_facts(af)
                         vars_copy.update(cleaned_toplevel)
 
             # set the failed property if it was missing.
@@ -712,7 +715,10 @@ class TaskExecutor:
                     condname = 'failed'
 
                     if self._task.failed_when:
-                        result['failed_when_result'] = result['failed'] = self._task._resolve_conditional(self._task.failed_when, vars_copy)
+                        is_failed = result['failed_when_result'] = result['failed'] = self._task._resolve_conditional(self._task.failed_when, vars_copy)
+
+                        if not is_failed and (suppressed_exception := result.pop('exception', None)):
+                            result['failed_when_suppressed_exception'] = suppressed_exception
 
                 except AnsibleError as e:
                     result['failed'] = True
@@ -756,9 +762,13 @@ class TaskExecutor:
                 # TODO: cleaning of facts should eventually become part of taskresults instead of vars
                 af = result['ansible_facts']
                 variables['ansible_facts'] = combine_vars(variables.get('ansible_facts', {}), namespace_facts(af))
-                if C.INJECT_FACTS_AS_VARS:
-                    # DTFIX-FUTURE: why is this happening twice, esp since we're post-fork and these will be discarded?
-                    cleaned_toplevel = {k: _deprecate_top_level_fact(v) for k, v in clean_facts(af).items()}
+                if _INJECT_FACTS:
+                    if _INJECT_FACTS_ORIGIN == 'default':
+                        # This happens x2 due to loops and being able to use values in subsequent iterations
+                        # these copies are later discared in favor of 'total/final' one on loop end.
+                        cleaned_toplevel = {k: _deprecate_top_level_fact(v) for k, v in clean_facts(af).items()}
+                    else:
+                        cleaned_toplevel = clean_facts(af)
                     variables.update(cleaned_toplevel)
 
         # save the notification target in the result, if it was specified, as
@@ -771,14 +781,18 @@ class TaskExecutor:
         # on the results side without having to do any further templating
         # also now add connection vars results when delegating
         if self._task.delegate_to:
-            result["_ansible_delegated_vars"] = {'ansible_delegated_host': self._task.delegate_to}
-            for k in plugin_vars:
-                result["_ansible_delegated_vars"][k] = cvars.get(k)
+            result["_ansible_delegated_vars"] = {
+                "ansible_delegated_host": self._task.delegate_to,
+                "ansible_connection": current_connection,
+            }
 
             # note: here for callbacks that rely on this info to display delegation
-            for requireshed in ('ansible_host', 'ansible_port', 'ansible_user', 'ansible_connection'):
-                if requireshed not in result["_ansible_delegated_vars"] and requireshed in cvars:
-                    result["_ansible_delegated_vars"][requireshed] = cvars.get(requireshed)
+            for k in plugin_vars:
+                if k not in _SUB_PRESERVE["_ansible_delegated_vars"]:
+                    continue
+
+                for o in C.config.get_plugin_options_from_var("connection", current_connection, k):
+                    result["_ansible_delegated_vars"][k] = self._connection.get_option(o)
 
         # and return
         display.debug("attempt loop complete, returning result")
@@ -953,9 +967,6 @@ class TaskExecutor:
 
         self._play_context.connection = current_connection
 
-        # TODO: play context has logic to update the connection for 'smart'
-        # (default value, will chose between ssh and paramiko) and 'persistent'
-        # (really paramiko), eventually this should move to task object itself.
         conn_type = self._play_context.connection
 
         connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
